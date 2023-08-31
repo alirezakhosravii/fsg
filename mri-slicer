@@ -1,0 +1,31 @@
+import numpy as np
+import nibabel as nib
+import ipywidgets as widgets
+from IPython.display import display
+import matplotlib.pyplot as plt
+
+# Load the NIFTI file
+nifti_file_path = "/path/user/x.nii"
+img = nib.load(nifti_file_path)
+data = img.get_fdata()
+
+# Define the function to visualize the slices
+def plot_slice(slice_num, view):
+    plt.figure(figsize=(10, 7))
+    
+    if view == "Axial":
+        plt.imshow(data[:, :, slice_num].T, cmap="gray", origin="lower")
+    elif view == "Sagittal":
+        plt.imshow(data[slice_num, :, :].T, cmap="gray", origin="lower")
+    elif view == "Coronal":
+        plt.imshow(data[:, slice_num, :].T, cmap="gray", origin="lower")
+    
+    plt.axis('off')
+    plt.show()
+
+# Create widgets for interaction
+slice_slider = widgets.IntSlider(min=0, max=data.shape[2] - 1, step=1, value=data.shape[2] // 2, description="Slice Number")
+view_dropdown = widgets.Dropdown(options=["Axial", "Sagittal", "Coronal"], value="Axial", description="View:")
+
+# Display the interactive plot
+widgets.interactive(plot_slice, slice_num=slice_slider, view=view_dropdown)
