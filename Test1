@@ -1,0 +1,254 @@
+import numpy as np
+import cv2
+from tkinter import *
+from PIL import Image, ImageTk
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+from scipy.ndimage import gaussian_filter
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from tkinter import filedialog
+
+# Gaussian modeling functions
+def gaussian(x, A, x0, sigma):
+    return A*np.exp(-(x-x0)**2/(2*sigma**2))
+
+def fit_gaussian(frame):
+    x = np.arange(frame.shape[1])
+    y = np.average(frame, axis=0)
+    popt, _ = curve_fit(gaussian, x, y, p0=[np.max(y), np.argmax(y), np.std(y)])
+    return popt
+
+# Intensity gradient functions
+def compute_gradient(frame):
+    gradient = np.gradient(frame)
+    magnitude = np.sqrt(gradient[0]**2 + gradient[1]**2)
+    normalized = magnitude / magnitude.max()
+    return normalized
+
+# Thresholding and overlay
+def adaptive_thresholding(frame, popt):
+    """ Adaptive thresholding using percentiles of the Gaussian values. """
+    A, x0, sigma = popt
+    gauss_values = gaussian(frame, A, x0, sigma)
+    
+    # Use percentiles to determine thresholds
+    high_threshold = np.percentile(gauss_values, 90)  # 90th percentile
+    medium_threshold = np.percentile(gauss_values, 50)  # 50th percentile
+    
+    high_prob = gauss_values > high_threshold
+    medium_prob = (gauss_values <= high_threshold) & (gauss_values > medium_threshold)
+    low_prob = gauss_values <= medium_threshold
+    
+    return high_prob, medium_prob, low_prob
+
+def overlay_on_video(frame, high_prob, medium_prob, low_prob):
+    overlay_frame = frame.copy()
+    overlay_frame[high_prob] = [255, 0, 0]
+    overlay_frame[medium_prob] = [255, 255, 0]
+    overlay_frame[low_prob] = [0, 0, 255]
+    return overlay_frame
+
+# Resection zone
+def resection_zone(high_prob, medium_prob):
+    """
+    Determines the resection boundary based on high and medium probability regions.
+    """
+    resection_boundary = np.logical_or(high_prob, medium_prob)
+    
+    # Apply morphological operations here
+    kernel = np.ones((5,5), np.uint8)
+    resection_boundary = cv2.morphologyEx(resection_boundary.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+    resection_boundary = cv2.morphologyEx(resection_boundary, cv2.MORPH_OPEN, kernel)
+    
+    return resection_boundary
+
+def visualize_resection_zone(overlay_frame, resection_boundary):
+    """
+    Visualize the resection boundary on the overlay frame.
+    """
+    # Apply morphological gradient to get the boundary
+    kernel = np.ones((3,3), np.uint8)
+    boundary = cv2.morphologyEx(resection_boundary, cv2.MORPH_GRADIENT, kernel)
+    
+    overlay_frame[boundary == 1] = [0, 255, 255]  # Yellow color for the boundary
+    
+    return overlay_frame
+# Post-processing
+def smooth_segmentation(segmentation):
+    return gaussian_filter(segmentation.astype(float), sigma=1)
+
+# VideoPlayer class
+class VideoPlayer:
+    def __init__(self, window, window_title, video_path=None):
+        self.window = window
+        self.window.title(window_title)
+        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+        self.scroll_canvas = Canvas(self.window)
+        self.scroll_canvas.grid(row=0, column=0, sticky="news")
+        self.scrollbar = Scrollbar(self.window, orient="vertical", command=self.scroll_canvas.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.scroll_canvas.config(yscrollcommand=self.scrollbar.set)
+
+        self.frame = tk.Frame(self.scroll_canvas)
+        self.scroll_canvas.create_window((0,0), window=self.frame, anchor='nw')
+
+        self.frame.bind("<Configure>", lambda e: self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all")))
+
+        self.vid = None
+        self.delay = 100
+        self.is_playing = False
+
+        self.canvas = tk.Canvas(self.frame, width=640, height=480)
+        self.canvas.grid(row=0, column=0, padx=10, pady=20)
+
+        self.canvas_gray = tk.Canvas(self.frame, width=640, height=480)
+        self.canvas_gray.grid(row=0, column=1, padx=10, pady=20)
+        
+        # Added initialization for overlay canvas
+        self.canvas_overlay = tk.Canvas(self.frame, width=640, height=480)
+        self.canvas_overlay.grid(row=1, column=0, padx=10, pady=20)
+
+        self.btn_open = tk.Button(self.frame, text="Open Video", command=self.open_video)
+        self.btn_open.grid(row=2, column=0, padx=10, pady=20)
+
+        self.btn_play = tk.Button(self.frame, text="Play", command=self.play_video, state=tk.DISABLED)
+        self.btn_play.grid(row=2, column=1, padx=10, pady=20)
+        # Add labels for color significance
+        label_high = tk.Label(self.frame, text="High Tumor Probability", bg="red", fg="white")
+        label_high.grid(row=3, column=0, padx=10, pady=5, sticky="w")
+
+        label_medium = tk.Label(self.frame, text="Medium Tumor Probability", bg="yellow", fg="black")
+        label_medium.grid(row=4, column=0, padx=10, pady=5, sticky="w")
+
+        label_low = tk.Label(self.frame, text="Low Tumor Probability", bg="blue", fg="white")
+        label_low.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+
+        label_resection = tk.Label(self.frame, text="Resection Zone", bg="yellow", fg="black")
+        label_resection.grid(row=6, column=0, padx=10, pady=5, sticky="w")
+
+        if video_path:
+            self.vid = cv2.VideoCapture(video_path)
+            if not self.vid.isOpened():
+                raise ValueError("Unable to open video source")
+            self.delay = int(1000 / self.vid.get(cv2.CAP_PROP_FPS))
+            self.btn_play.config(state=tk.NORMAL)
+
+        self.fig, self.ax = plt.subplots(figsize=(6, 4))
+        self.canvas2 = FigureCanvasTkAgg(self.fig, self.frame)
+        self.canvas2.get_tk_widget().grid(row=3, columnspan=2, padx=10, pady=20)
+
+        self.line, = self.ax.plot([], [], 'r-')
+        self.line2, = self.ax.plot([], [], 'g-')
+        self.line3, = self.ax.plot([], [], 'b-')
+        self.ax.set_xlim(0, 1)
+        self.ax.set_ylim(0, 255)   
+    
+    def on_closing(self):
+        self.is_playing = False
+        if self.vid:
+            self.vid.release()
+        self.window.destroy()
+
+    def open_video(self):
+        self.vid = cv2.VideoCapture(filedialog.askopenfilename())
+        if not self.vid.isOpened():
+            raise ValueError("Unable to open video source")
+        self.delay = int(1000 / self.vid.get(cv2.CAP_PROP_FPS))
+        self.btn_play.config(state=tk.NORMAL)
+        
+    def resize_frame_to_fit(self, frame, desired_width, desired_height):
+        """
+        Resize the frame to fit within the desired dimensions while maintaining the aspect ratio.
+        """
+        height, width = frame.shape[:2]
+        aspect_ratio = width / height
+
+        if width > height:
+            new_width = desired_width
+            new_height = int(desired_width / aspect_ratio)
+        else:
+            new_height = desired_height
+            new_width = int(desired_height * aspect_ratio)
+
+        resized_frame = cv2.resize(frame, (new_width, new_height))
+        return resized_frame
+    
+    def play_video(self):
+        self.is_playing = True
+        self.update()
+
+    def process_frame(self, frame):
+        # Convert frame to grayscale and blur it
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    
+        # Ensure the frame is truly grayscale for further processing
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+    
+            gray = cv2.GaussianBlur(gray, (5,5), 0)
+    
+        # Compute gaussian parameters and threshold frame using adaptive thresholding
+        popt = fit_gaussian(gray)
+        high_prob, medium_prob, low_prob = adaptive_thresholding(gray, popt)
+    
+        # Compute resection zone
+        resection = resection_zone(high_prob, medium_prob)
+    
+        # Visualize the resection zone on the overlay frame
+        overlay_frame = visualize_resection_zone(frame.copy(), resection)
+    
+        # Overlay thresholded regions on the frame
+        overlay_frame = overlay_on_video(overlay_frame, high_prob, medium_prob, low_prob)
+    
+        # Smooth the resection zone
+        smoothed_resection = smooth_segmentation(resection)
+
+        return gray, overlay_frame, smoothed_resection
+
+
+        
+    def update(self):
+        if self.vid and self.vid.isOpened() and self.is_playing:
+            ret, frame = self.vid.read()
+            if ret:
+                gray, overlay_frame, smoothed_resection = self.process_frame(frame)
+            
+                # Resize frames to fit the canvas dimensions while maintaining aspect ratio
+                frame_resized = self.resize_frame_to_fit(frame, self.canvas.winfo_width(), self.canvas.winfo_height())
+                overlay_frame_resized = self.resize_frame_to_fit(overlay_frame, self.canvas_overlay.winfo_width(), self.canvas_overlay.winfo_height())
+                gray_resized = self.resize_frame_to_fit(gray, self.canvas_gray.winfo_width(), self.canvas_gray.winfo_height())
+            
+                self.photo = ImageTk.PhotoImage(image=Image.fromarray(cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)))
+                self.canvas.create_image(0, 0, image=self.photo, anchor=tk.NW)
+
+                self.photo_gray = ImageTk.PhotoImage(image=Image.fromarray(gray_resized))
+                self.canvas_gray.create_image(0, 0, image=self.photo_gray, anchor=tk.NW)
+
+                self.overlay_photo = ImageTk.PhotoImage(image=Image.fromarray(overlay_frame_resized))
+                self.canvas_overlay.create_image(0, 0, image=self.overlay_photo, anchor=tk.NW)
+
+                # Update RGB plot
+                avg_color = np.mean(frame, axis=(0,1))
+                xdata = np.arange(len(self.line.get_ydata())+1)
+                self.line.set_ydata(np.append(self.line.get_ydata(), avg_color[2]))
+                self.line2.set_ydata(np.append(self.line2.get_ydata(), avg_color[1]))
+                self.line3.set_ydata(np.append(self.line3.get_ydata(), avg_color[0]))
+                self.line.set_xdata(xdata)
+                self.line2.set_xdata(xdata)
+                self.line3.set_xdata(xdata)
+                self.ax.set_xlim(0, len(xdata))
+                self.canvas2.draw()
+
+                self.window.after(self.delay, self.update)
+            else:
+                print("Video playback completed.")
+                self.btn_play.config(state=tk.DISABLED)
+                self.is_playing = False
+                
+root = tk.Tk()
+root.grid_rowconfigure(0, weight=1)
+root.grid_columnconfigure(0, weight=1)
+VideoPlayer(root, "Video Player with RGB Plot and Grayscale Display")
+root.mainloop()
